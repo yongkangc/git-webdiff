@@ -9,30 +9,42 @@ export interface UnifiedFileData {
   content_b: string | null;
   diff_ops: DiffRange[];
   diff_error?: string;
+  truncated?: boolean;
+  truncated_lines?: number;
+  truncated_bytes?: number;
 }
 
 /**
  * Fetches all data needed to render a file diff in a single request.
  * This includes thick diff metadata, file contents for both sides, and diff operations.
+ *
+ * @param idx File pair index
+ * @param options Diff options flags
+ * @param normalizeJson Whether to normalize JSON before diffing
+ * @param noTruncate If true, fetch full content even if lines are very long
  */
 export async function getUnifiedFileData(
   idx: number,
   options: string[],
-  normalizeJson: boolean
+  normalizeJson: boolean,
+  noTruncate: boolean = false
 ): Promise<UnifiedFileData> {
   const params = new URLSearchParams();
   params.set('normalize_json', String(normalizeJson));
   if (options.length > 0) {
     params.set('options', options.join(','));
   }
+  if (noTruncate) {
+    params.set('no_truncate', '1');
+  }
 
   const response = await fetch(apiUrl(`/file/${idx}?${params}`));
   if (!response.ok) {
     throw new Error(`Failed to fetch file data: ${response.statusText}`);
   }
-  
+
   const data = await response.json();
-  
+
   // Transform the response to match our expected types
   return {
     idx: data.idx,
@@ -40,7 +52,10 @@ export async function getUnifiedFileData(
     content_a: data.content_a,
     content_b: data.content_b,
     diff_ops: data.diff_ops || [],
-    diff_error: data.diff_error
+    diff_error: data.diff_error,
+    truncated: data.truncated,
+    truncated_lines: data.truncated_lines,
+    truncated_bytes: data.truncated_bytes
   };
 }
 

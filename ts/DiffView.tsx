@@ -21,6 +21,7 @@ export interface Props {
 export function DiffView(props: Props) {
   const {diffOptions, thinFilePair, normalizeJSON} = props;
   const [unifiedData, setUnifiedData] = React.useState<UnifiedFileData | null>(null);
+  const [noTruncate, setNoTruncate] = React.useState(false);
 
   React.useEffect(() => {
     (async () => {
@@ -29,17 +30,50 @@ export function DiffView(props: Props) {
         const data = await getUnifiedFileData(
           thinFilePair.idx,
           gitDiffOptionsToFlags(diffOptions),
-          normalizeJSON
+          normalizeJSON,
+          noTruncate
         );
         setUnifiedData(data);
       } catch (e) {
         console.error('Failed to load file data:', e);
       }
     })();
-  }, [thinFilePair.idx, diffOptions, normalizeJSON]);
+  }, [thinFilePair.idx, diffOptions, normalizeJSON, noTruncate]);
 
   if (!unifiedData) {
     return <div>Loading…</div>;
+  }
+
+  // Check if file was truncated
+  if (unifiedData.truncated && !noTruncate) {
+    const bytesInMB = (unifiedData.truncated_bytes || 0) / (1024 * 1024);
+    return (
+      <div className="diff">
+        <table className="diff">
+          <tbody>
+            <tr>
+              <td className="code equal before suppressed-large-diff">
+                <p>⚠️ This file may be minified and the diff may slow down the browser. ⚠️</p>
+                <p>
+                  {unifiedData.truncated_lines} lines exceed 500 characters
+                  ({bytesInMB.toFixed(2)} MB would be hidden)
+                </p>
+                <p>
+                  <a
+                    href="#"
+                    onClick={e => {
+                      e.preventDefault();
+                      setNoTruncate(true);
+                    }}>
+                    Render diff anyway
+                  </a>
+                </p>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    );
   }
 
   // Use the thick data from unified response
@@ -61,7 +95,10 @@ export function DiffView(props: Props) {
         preloadedData={{
           content_a: unifiedData.content_a,
           content_b: unifiedData.content_b,
-          diff_ops: unifiedData.diff_ops
+          diff_ops: unifiedData.diff_ops,
+          truncated: unifiedData.truncated,
+          truncated_lines: unifiedData.truncated_lines,
+          truncated_bytes: unifiedData.truncated_bytes
         }}
       />
     );

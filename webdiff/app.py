@@ -220,14 +220,37 @@ def create_app(root_path: str = "") -> FastAPI:
 
 
 
+    def check_for_long_lines(content: str, max_length: int = 500):
+        """Check if content has lines exceeding max_length.
+
+        Returns (has_long_lines, num_lines_affected, total_bytes_over_limit)
+        """
+        if not content:
+            return False, 0, 0
+
+        lines = content.split('\n')
+        lines_affected = 0
+        bytes_over = 0
+
+        for line in lines:
+            if len(line) > max_length:
+                lines_affected += 1
+                bytes_over += len(line) - max_length
+
+        return lines_affected > 0, lines_affected, bytes_over
+
     @app.get("/file/{idx}")
     async def get_file_complete(
         idx: int,
         normalize_json: bool = False,
-        options: Optional[str] = None  # Comma-separated diff options
+        options: Optional[str] = None,  # Comma-separated diff options
+        no_truncate: int = 0  # Set to 1 to disable truncation
     ):
         """Get all data needed to render a file diff in one request."""
         global DIFF, SERVER_CONFIG
+
+        # Maximum line length before we warn about truncation
+        MAX_LINE_LENGTH = 500
 
         # Validate index
         if idx < 0 or idx >= len(DIFF):
@@ -242,11 +265,52 @@ def create_app(root_path: str = "") -> FastAPI:
         response = {
             'idx': idx,
             'thick': thick_data,
+            'truncated': False,
+            'truncated_lines': 0,
+            'truncated_bytes': 0,
             'content_a': None,
             'content_b': None,
             'diff_ops': []
         }
 
+        # First, check if we need to warn about long lines (unless no_truncate is set)
+        if no_truncate == 0:
+            # Read files to check for long lines
+            content_a_to_check = None
+            content_b_to_check = None
+
+            if file_pair.a:
+                try:
+                    abs_path_a = file_pair.a_path
+                    if not is_binary(abs_path_a):
+                        path_to_read = util.normalize_json(abs_path_a) if normalize_json else abs_path_a
+                        with open(path_to_read, 'r') as f:
+                            content_a_to_check = f.read()
+                except:
+                    pass
+
+            if file_pair.b:
+                try:
+                    abs_path_b = file_pair.b_path
+                    if not is_binary(abs_path_b):
+                        path_to_read = util.normalize_json(abs_path_b) if normalize_json else abs_path_b
+                        with open(path_to_read, 'r') as f:
+                            content_b_to_check = f.read()
+                except:
+                    pass
+
+            # Check both sides for long lines
+            has_long_a, lines_a, bytes_a = check_for_long_lines(content_a_to_check, MAX_LINE_LENGTH)
+            has_long_b, lines_b, bytes_b = check_for_long_lines(content_b_to_check, MAX_LINE_LENGTH)
+
+            if has_long_a or has_long_b:
+                # Return truncation warning without content
+                response['truncated'] = True
+                response['truncated_lines'] = lines_a + lines_b
+                response['truncated_bytes'] = bytes_a + bytes_b
+                return JSONResponse(response)
+
+        # If we get here, either no_truncate=1 or no long lines detected
         # Get content for side A
         if file_pair.a:
             try:

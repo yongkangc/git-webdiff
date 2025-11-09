@@ -77,6 +77,9 @@ export interface CodeDiffContainerProps {
     content_a: string | null;
     content_b: string | null;
     diff_ops: DiffRange[];
+    truncated?: boolean;
+    truncated_lines?: number;
+    truncated_bytes?: number;
   };
 }
 
