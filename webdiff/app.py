@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 
 import dataclasses
+import hashlib
 import json
 import logging
 import mimetypes
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -42,6 +44,26 @@ PORT = None
 HOSTNAME = 'localhost'
 DEBUG = os.environ.get('DEBUG')
 WEBDIFF_DIR = determine_path()
+
+# Hot reload support (no-restart approach with difftool management)
+GIT_ARGS = []  # Original git arguments for git difftool
+GIT_CWD = None  # Working directory for git commands
+WATCH_ENABLED = False  # Whether watch mode is enabled
+INITIAL_CHECKSUM = None  # Checksum when server started
+CURRENT_CHECKSUM = None  # Current diff checksum (updated by watch thread)
+CHECKSUM_LOCK = threading.Lock()  # Lock for checksum updates
+
+# Difftool process management
+DIFFTOOL_PROC = None  # The git difftool process
+DIFFTOOL_LOCK = threading.Lock()  # Lock for difftool operations
+DIFF_LOCK = threading.Lock()  # Lock for DIFF updates
+RELOAD_IN_PROGRESS = False  # Flag to prevent concurrent reloads
+RELOAD_LOCK = threading.Lock()  # Lock for reload state
+
+# Timeout support
+START_TIME = None  # Server start time
+TIMEOUT_MINUTES = 0  # Timeout in minutes (0 = no timeout)
+PARSED_ARGS = None  # Stored parsed arguments for reload
 
 class ClientDisconnectMiddleware(BaseHTTPMiddleware):
     """Middleware to handle client disconnects gracefully."""
@@ -181,6 +203,8 @@ def create_app(root_path: str = "") -> FastAPI:
                     'pairs': diff.get_thin_list(DIFF),
                     'server_config': SERVER_CONFIG,
                     'root_path': app.root_path,
+                    'git_args': GIT_ARGS,  # For the command bar UI
+                    'watch_enabled': WATCH_ENABLED,  # Whether hot reload is enabled
                 }
 
                 html = html.replace(
@@ -310,10 +334,258 @@ def create_app(root_path: str = "") -> FastAPI:
         except util.ImageMagickError as e:
             return JSONResponse(f'ImageMagick error {e}', status_code=501)
 
+    @app.get("/api/diff-changed")
+    async def diff_changed():
+        """Check if diff has changed."""
+        global WATCH_ENABLED, INITIAL_CHECKSUM, CURRENT_CHECKSUM
+
+        if not WATCH_ENABLED:
+            return JSONResponse(
+                {
+                    'watch_enabled': False,
+                    'changed': False
+                },
+                headers={
+                    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+                    'Pragma': 'no-cache',
+                    'Expires': '0'
+                }
+            )
+
+        # Check if checksum has changed
+        with CHECKSUM_LOCK:
+            changed = (INITIAL_CHECKSUM is not None and
+                      CURRENT_CHECKSUM is not None and
+                      CURRENT_CHECKSUM != INITIAL_CHECKSUM)
+            if DEBUG and changed:
+                logging.debug(f"Checksums differ: initial={INITIAL_CHECKSUM[:8] if INITIAL_CHECKSUM else None}, current={CURRENT_CHECKSUM[:8] if CURRENT_CHECKSUM else None}")
+
+        return JSONResponse(
+            {
+                'watch_enabled': True,
+                'changed': changed
+            },
+            headers={
+                'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+                'Pragma': 'no-cache',
+                'Expires': '0'
+            }
+        )
+
+    @app.post("/api/server-reload")
+    async def server_reload(request: Request):
+        """Trigger diff refresh synchronously.
+
+        Optional JSON body: {"git_args": ["HEAD~3..HEAD"]} to change diff scope.
+
+        This endpoint blocks until the refresh is complete, then returns success.
+        The frontend will reload the page after getting the response.
+        """
+        try:
+            # Parse optional git_args from request body
+            new_git_args = None
+            try:
+                body = await request.json()
+                if 'git_args' in body:
+                    new_git_args = body['git_args']
+            except:
+                pass  # No body or invalid JSON, use current args
+
+            # Call refresh_diff synchronously (it returns success, message)
+            success, message = refresh_diff(new_git_args)
+
+            if success:
+                return JSONResponse({
+                    'success': True,
+                    'message': message
+                })
+            else:
+                return JSONResponse({
+                    'success': False,
+                    'error': message
+                }, status_code=500)
+
+        except Exception as e:
+            logging.error(f"Error in server_reload: {e}")
+            return JSONResponse({
+                'success': False,
+                'error': str(e)
+            }, status_code=500)
+
     return app
 
 
+def start_git_difftool(git_args, git_cwd):
+    """Start git difftool with wrapper and return (process, left_dir, right_dir).
 
+    Returns None if difftool fails to start or can't read directories.
+    """
+    import shlex
+
+    # Get path to difftool wrapper script
+    wrapper_path = os.path.join(WEBDIFF_DIR, 'difftool-wrapper.sh')
+
+    # Make sure wrapper is executable
+    os.chmod(wrapper_path, 0o755)
+
+    # Build git difftool command
+    cmd = ['git', 'difftool', '-d', '-x', wrapper_path] + git_args
+
+    logging.info(f"Starting git difftool: {' '.join(cmd)}")
+
+    try:
+        # Start the process
+        proc = subprocess.Popen(
+            cmd,
+            cwd=git_cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1  # Line buffered
+        )
+
+        # Read the two directory paths from stdout
+        left_dir = proc.stdout.readline().strip()
+        right_dir = proc.stdout.readline().strip()
+
+        if not left_dir or not right_dir:
+            logging.error("Failed to read temp directories from difftool wrapper")
+            proc.kill()
+            return None
+
+        logging.info(f"Difftool temp dirs: {left_dir}, {right_dir}")
+
+        # Verify directories exist
+        if not os.path.isdir(left_dir) or not os.path.isdir(right_dir):
+            logging.error(f"Temp directories don't exist: {left_dir}, {right_dir}")
+            proc.kill()
+            return None
+
+        return proc, left_dir, right_dir
+
+    except Exception as e:
+        logging.error(f"Failed to start git difftool: {e}")
+        return None
+
+
+def refresh_diff(new_git_args=None):
+    """Refresh the DIFF by restarting git difftool.
+
+    Runs synchronously when user requests reload.
+
+    Args:
+        new_git_args: Optional new git arguments (for changing diff scope)
+
+    Returns:
+        (success, message) tuple
+    """
+    global DIFFTOOL_PROC, DIFF, GIT_ARGS, RELOAD_IN_PROGRESS, CURRENT_CHECKSUM, INITIAL_CHECKSUM
+
+    print(f"refresh_diff() called, new_git_args={new_git_args}")
+
+    with RELOAD_LOCK:
+        if RELOAD_IN_PROGRESS:
+            print("Reload already in progress, returning")
+            return False, "Reload already in progress"
+        RELOAD_IN_PROGRESS = True
+
+    try:
+        # Use new args if provided, otherwise use current args
+        git_args = new_git_args if new_git_args is not None else GIT_ARGS
+
+        logging.info(f"Refreshing diff with args: {git_args}")
+
+        # Kill old difftool process if it exists
+        with DIFFTOOL_LOCK:
+            if DIFFTOOL_PROC:
+                try:
+                    DIFFTOOL_PROC.terminate()
+                    DIFFTOOL_PROC.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    DIFFTOOL_PROC.kill()
+                    DIFFTOOL_PROC.wait()
+                except Exception as e:
+                    logging.warning(f"Error killing old difftool: {e}")
+
+        # Start new difftool process
+        result = start_git_difftool(git_args, GIT_CWD)
+
+        if result is None:
+            with RELOAD_LOCK:
+                RELOAD_IN_PROGRESS = False
+            return False, "Failed to start git difftool"
+
+        new_proc, left_dir, right_dir = result
+
+        # Update global DIFF using dirdiff.gitdiff
+        try:
+            new_diff = dirdiff.gitdiff(left_dir, right_dir, SERVER_CONFIG['webdiff'])
+
+            # Atomically update globals
+            with DIFFTOOL_LOCK:
+                DIFFTOOL_PROC = new_proc
+
+            with DIFF_LOCK:
+                DIFF = new_diff
+
+            # Update GIT_ARGS if new ones were provided
+            if new_git_args is not None:
+                GIT_ARGS = new_git_args
+
+            # Update checksum and reset baseline
+            new_checksum = compute_diff_checksum()
+            print(f"Reload complete, resetting checksum to: {new_checksum[:8] if new_checksum else None}")
+            logging.info(f"Reload complete, resetting checksum to: {new_checksum[:8] if new_checksum else None}")
+            with CHECKSUM_LOCK:
+                old_initial = INITIAL_CHECKSUM
+                CURRENT_CHECKSUM = new_checksum
+                INITIAL_CHECKSUM = new_checksum  # Reset baseline to new checksum
+                print(f"Checksum reset: INITIAL {old_initial[:8] if old_initial else None} -> {INITIAL_CHECKSUM[:8] if INITIAL_CHECKSUM else None}")
+
+            # Clear reload flag
+            with RELOAD_LOCK:
+                RELOAD_IN_PROGRESS = False
+
+            logging.info(f"Diff refreshed successfully ({len(new_diff)} files)")
+            return True, f"Reloaded {len(new_diff)} files"
+
+        except Exception as e:
+            logging.error(f"Failed to compute new diff: {e}")
+            # Kill the new process since we failed
+            try:
+                new_proc.kill()
+            except:
+                pass
+
+            with RELOAD_LOCK:
+                RELOAD_IN_PROGRESS = False
+
+            return False, f"Failed to compute diff: {str(e)}"
+
+    except Exception as e:
+        logging.error(f"Error in refresh_diff: {e}")
+        with RELOAD_LOCK:
+            RELOAD_IN_PROGRESS = False
+        return False, str(e)
+
+
+def timeout_thread():
+    """Background thread that checks timeout and shuts down server if needed."""
+    global START_TIME, TIMEOUT_MINUTES
+
+    if TIMEOUT_MINUTES <= 0:
+        return  # No timeout configured
+
+    logging.info(f"Timeout thread started ({TIMEOUT_MINUTES} minutes)")
+
+    while True:
+        time.sleep(60)  # Check every minute
+
+        elapsed_minutes = (time.time() - START_TIME) / 60
+
+        if elapsed_minutes >= TIMEOUT_MINUTES:
+            logging.info(f"Timeout reached ({TIMEOUT_MINUTES} minutes). Shutting down...")
+            os._exit(0)  # Force exit the entire process
 
 
 def random_port():
@@ -330,8 +602,92 @@ def find_port(webdiff_config):
     return random_port()
 
 
+def compute_diff_checksum():
+    """Compute checksum of the current git diff output.
+
+    Returns None if we don't have git context (can't reload).
+    """
+    global GIT_ARGS, GIT_CWD
+
+    if not GIT_CWD:
+        return None
+
+    try:
+        # Re-run the original git diff command
+        # If GIT_ARGS is empty, just run 'git diff' (compares working tree to HEAD)
+        cmd = ['git', 'diff']
+        if GIT_ARGS:
+            cmd += GIT_ARGS
+        result = subprocess.run(
+            cmd,
+            cwd=GIT_CWD,
+            capture_output=True,
+            timeout=30  # Prevent hanging
+        )
+
+        if result.returncode not in (0, 1):  # 0 = no diff, 1 = has diff
+            logging.warning(f"git diff command failed with code {result.returncode}")
+            logging.warning(f"Command was: {' '.join(cmd)}")
+            logging.warning(f"Working directory: {GIT_CWD}")
+            if result.stderr:
+                stderr_str = result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr
+                logging.warning(f"git diff stderr: {stderr_str}")
+            return None
+
+        # Compute SHA256 checksum of the diff output
+        checksum = hashlib.sha256(result.stdout).hexdigest()
+        return checksum
+    except subprocess.TimeoutExpired:
+        logging.error("git diff command timed out")
+        return None
+    except Exception as e:
+        logging.error(f"Error computing diff checksum: {e}")
+        return None
+
+
+def check_for_changes_thread(poll_interval=5):
+    """Background thread that polls for diff changes and updates CURRENT_CHECKSUM.
+
+    Does NOT trigger restarts - just updates the checksum.
+    The /api/server-reload endpoint triggers the actual restart.
+
+    Args:
+        poll_interval: How often to check (in seconds)
+    """
+    global CURRENT_CHECKSUM, WATCH_ENABLED
+
+    print(f"Watch thread started (polling every {poll_interval}s)")
+    logging.info(f"Watch thread started (polling every {poll_interval}s)")
+
+    while WATCH_ENABLED:
+        try:
+            new_checksum = compute_diff_checksum()
+
+            if new_checksum is None:
+                # Can't compute checksum, sleep and retry
+                print(f"Watch thread: checksum is None, skipping")
+                time.sleep(poll_interval)
+                continue
+
+            with CHECKSUM_LOCK:
+                if new_checksum != CURRENT_CHECKSUM:
+                    print(f"Diff change detected - old: {CURRENT_CHECKSUM[:8] if CURRENT_CHECKSUM else None}, new: {new_checksum[:8] if new_checksum else None}")
+                    logging.info(f"Diff change detected - old: {CURRENT_CHECKSUM[:8] if CURRENT_CHECKSUM else None}, new: {new_checksum[:8] if new_checksum else None}")
+                # Always update to latest checksum
+                CURRENT_CHECKSUM = new_checksum
+
+            time.sleep(poll_interval)
+        except Exception as e:
+            print(f"Error in watch thread: {e}")
+            logging.error(f"Error in watch thread: {e}")
+            time.sleep(poll_interval)
+
+
 def run():
-    global DIFF, PORT, HOSTNAME, SERVER_CONFIG
+    global DIFF, PORT, HOSTNAME, SERVER_CONFIG, PARSED_ARGS
+    global GIT_ARGS, GIT_CWD, WATCH_ENABLED, INITIAL_CHECKSUM, CURRENT_CHECKSUM
+    global DIFFTOOL_PROC, START_TIME, TIMEOUT_MINUTES
+
     try:
         parsed_args = argparser.parse(sys.argv[1:])
     except argparser.UsageError as e:
@@ -347,14 +703,56 @@ def run():
     if parsed_args.get('port') and parsed_args['port'] != -1:
         PORT = parsed_args['port']
 
+    # Store parsed args for reload functionality
+    PARSED_ARGS = parsed_args
+
+    # Extract git context from environment (set by git-webdiff.sh)
+    git_args_str = os.environ.get('WEBDIFF_GIT_ARGS', '').strip()
+    if git_args_str:
+        # Parse the shell-quoted string back into a list
+        import shlex
+        # Filter out empty strings that can occur when bash array was empty
+        GIT_ARGS = [arg for arg in shlex.split(git_args_str) if arg]
+
+    GIT_CWD = os.environ.get('WEBDIFF_CWD', None)
+
+    # Check if watch mode is enabled
+    watch_interval = parsed_args.get('watch', 0)
+    if watch_interval > 0 and GIT_CWD:
+        WATCH_ENABLED = True
+        # Compute initial checksum
+        checksum = compute_diff_checksum()
+        INITIAL_CHECKSUM = checksum
+        CURRENT_CHECKSUM = checksum
+        if CURRENT_CHECKSUM:
+            print(f"Watch mode enabled (interval: {watch_interval}s, initial checksum: {CURRENT_CHECKSUM[:8]})")
+            logging.info(f"Watch mode enabled (interval: {watch_interval}s)")
+        else:
+            logging.warning("Watch mode enabled but could not compute initial checksum")
+    elif watch_interval > 0:
+        logging.warning("Watch mode requested but no git context available (GIT_CWD missing)")
+
+    # Determine how to load the DIFF
     if 'dirs' in parsed_args:
+        # Direct directory comparison (not using git difftool)
         DIFF = dirdiff.gitdiff(*parsed_args['dirs'], WEBDIFF_CONFIG)
     elif 'files' in parsed_args:
+        # Direct file comparison
         a_file, b_file = parsed_args['files']
         DIFF = [argparser._shim_for_file_diff(a_file, b_file)]
     else:
-        # Git difftool mode
-        if len(sys.argv) == 3:
+        # Git difftool mode - start difftool process and get temp dirs
+        if GIT_CWD:
+            # We have git context - start difftool process
+            result = start_git_difftool(GIT_ARGS, GIT_CWD)
+            if result is None:
+                sys.stderr.write("Error: Failed to start git difftool\n")
+                sys.exit(1)
+
+            DIFFTOOL_PROC, left_dir, right_dir = result
+            DIFF = dirdiff.gitdiff(left_dir, right_dir, WEBDIFF_CONFIG)
+        elif len(sys.argv) == 3:
+            # Legacy mode - direct file paths from git difftool wrapper call
             DIFF = [argparser._shim_for_file_diff(sys.argv[1], sys.argv[2])]
         else:
             DIFF = []
@@ -372,8 +770,9 @@ def run():
     else:
         print(f"Starting webdiff server at http://{HOSTNAME}:{PORT}")
 
-    # Get timeout value from parsed args
-    timeout = parsed_args.get('timeout', 0)
+    # Get timeout value from parsed args and initialize START_TIME
+    TIMEOUT_MINUTES = parsed_args.get('timeout', 0)
+    START_TIME = time.time()
 
     # Create server configuration
     config = uvicorn.Config(
@@ -387,22 +786,34 @@ def run():
     )
     server = uvicorn.Server(config)
 
-    if timeout > 0:
-        print(f"Server will automatically shut down after {timeout} minutes")
+    # Start timeout thread if enabled
+    if TIMEOUT_MINUTES > 0:
+        print(f"Server will automatically shut down after {TIMEOUT_MINUTES} minutes")
+        timeout_th = threading.Thread(target=timeout_thread, daemon=True)
+        timeout_th.start()
 
-        def shutdown_timer():
-            time.sleep(timeout * 60)  # Convert minutes to seconds
-            print(f"\nTimeout reached ({timeout} minutes). Shutting down server...")
-            server.should_exit = True
-
-        # Start the shutdown timer in a daemon thread
-        timer_thread = threading.Thread(target=shutdown_timer, daemon=True)
-        timer_thread.start()
+    # Start watch thread if enabled
+    if WATCH_ENABLED and watch_interval > 0:
+        watch_thread = threading.Thread(
+            target=check_for_changes_thread,
+            args=(watch_interval,),
+            daemon=True
+        )
+        watch_thread.start()
+        print(f"Watch mode active: checking for changes every {watch_interval} seconds")
 
     # Run server with graceful shutdown handling
     try:
         server.run()
     except KeyboardInterrupt:
+        # Clean up difftool process if it exists
+        with DIFFTOOL_LOCK:
+            if DIFFTOOL_PROC:
+                try:
+                    DIFFTOOL_PROC.terminate()
+                    DIFFTOOL_PROC.wait(timeout=5)
+                except:
+                    pass
         sys.exit(0)
 
 

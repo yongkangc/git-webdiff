@@ -8,9 +8,85 @@ import { DiffOptionsControl } from './DiffOptions';
 import { KeyboardShortcuts } from './codediff/KeyboardShortcuts';
 import { Options, encodeOptions, ServerConfig, parseOptions, UpdateOptionsFn } from './options';
 import { MultiFileView } from './MultiFileView';
+import { apiUrl } from './api-utils';
+import { CommandBar } from './CommandBar';
 
 declare const pairs: FilePair[];
 declare const SERVER_CONFIG: ServerConfig;
+declare const git_args: string[];
+declare const watch_enabled: boolean;
+
+// Hook for checking for diff updates
+function useReloadDetection(pollInterval: number = 5000) {
+  const [reloadAvailable, setReloadAvailable] = React.useState(false);
+  const [watchEnabled, setWatchEnabled] = React.useState(false);
+  const [reloadInProgress, setReloadInProgress] = React.useState(false);
+
+  React.useEffect(() => {
+    // Check for updates periodically
+    const checkForUpdates = async () => {
+      try {
+        const response = await fetch(apiUrl('/api/diff-changed'));
+        if (response.ok) {
+          const data = await response.json();
+          setWatchEnabled(data.watch_enabled);
+
+          // Show reload banner if diff has changed (checksum differs)
+          if (data.changed) {
+            setReloadAvailable(true);
+          }
+        }
+      } catch (error) {
+        console.error('Error checking for updates:', error);
+      }
+    };
+
+    // Initial check
+    checkForUpdates();
+
+    // Poll periodically
+    const interval = setInterval(checkForUpdates, pollInterval);
+
+    return () => clearInterval(interval);
+  }, [pollInterval]);
+
+  const reload = React.useCallback(async (newGitArgs?: string[]) => {
+    try {
+      setReloadInProgress(true);
+      setReloadAvailable(false);
+
+      // This blocks until the backend completes the refresh
+      const response = await fetch(apiUrl('/api/server-reload'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: newGitArgs ? JSON.stringify({ git_args: newGitArgs }) : undefined,
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success) {
+          // Refresh completed successfully, reload the page
+          window.location.reload();
+        } else {
+          setReloadInProgress(false);
+          console.error('Reload failed:', data.error);
+          alert('Failed to reload: ' + data.error);
+        }
+      } else {
+        setReloadInProgress(false);
+        alert('Failed to trigger reload');
+      }
+    } catch (error) {
+      setReloadInProgress(false);
+      console.error('Error reloading:', error);
+      alert('Failed to reload diff data');
+    }
+  }, []);
+
+  return { reloadAvailable, watchEnabled, reload, reloadInProgress };
+}
 
 // Webdiff application root.
 export function Root() {
@@ -20,6 +96,9 @@ export function Root() {
   const [showOptions, setShowOptions] = React.useState(false);
 
   const [searchParams, setSearchParams] = useSearchParams();
+
+  // Hot reload detection
+  const { reloadAvailable, reload, reloadInProgress } = useReloadDetection();
 
   // Set document title
   React.useEffect(() => {
@@ -57,13 +136,15 @@ export function Root() {
         setShowOptions(val => !val);
       } else if (e.code === 'KeyZ') {
         updateOptions(o => ({ normalizeJSON: !o.normalizeJSON }));
+      } else if (e.code === 'KeyR' && reloadAvailable) {
+        reload();
       }
     };
     document.addEventListener('keydown', handleKeydown);
     return () => {
       document.removeEventListener('keydown', handleKeydown);
     };
-  }, [updateOptions]);
+  }, [updateOptions, reloadAvailable, reload]);
 
   const inlineStyle = `
   td.code {
@@ -73,7 +154,18 @@ export function Root() {
   return (
     <>
       <style>{inlineStyle}</style>
-      <div>
+      <div style={{ padding: '16px', maxWidth: '1400px', margin: '0 auto' }}>
+        {/* Command bar for git args and reload */}
+        {watch_enabled && (
+          <CommandBar
+            initialGitArgs={git_args}
+            watchEnabled={watch_enabled}
+            diffChanged={reloadAvailable}
+            onReload={reload}
+            reloadInProgress={reloadInProgress}
+          />
+        )}
+
         <div
           style={{
             position: 'sticky',
@@ -90,6 +182,7 @@ export function Root() {
             padding: '4px',
             display: 'flex',
             gap: '4px',
+            transition: 'margin-top 0.3s, top 0.3s',
           }}
         >
           <button

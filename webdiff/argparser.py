@@ -32,7 +32,16 @@ def parse(args):
         '--root-path', type=str, help='Root path for the application (e.g., /webdiff).', default=''
     )
     parser.add_argument(
-        '--timeout', type=int, help='Automatically shut down the server after this many minutes.', default=0
+        '--timeout', type=int, help='Automatically shut down the server after this many minutes. Default: 0 (no timeout). Use 0 to disable.', default=0
+    )
+    parser.add_argument(
+        '--no-timeout', action='store_true', help='Disable automatic timeout (equivalent to --timeout 0).', default=False
+    )
+    parser.add_argument(
+        '--watch', type=int, help='Watch for diff changes and enable reload (poll interval in seconds). Default: 10. Use 0 to disable.', default=10
+    )
+    parser.add_argument(
+        '--no-watch', action='store_true', help='Disable watch mode (equivalent to --watch 0).', default=False
     )
 
     # Webdiff configuration options
@@ -108,11 +117,17 @@ def parse(args):
     }
 
     # TODO: convert out to a dataclass
+    # Handle --no-watch flag (overrides --watch)
+    watch_interval = 0 if args.no_watch else args.watch
+    # Handle --no-timeout flag (overrides --timeout)
+    timeout_minutes = 0 if args.no_timeout else args.timeout
+
     out = {
         'config': config,
         'port': args.port,
         'host': args.host,
-        'timeout': args.timeout,
+        'timeout': timeout_minutes,
+        'watch': watch_interval,
     }
 
     if len(args.dirs) > 2:

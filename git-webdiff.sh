@@ -1,31 +1,8 @@
 #!/bin/bash
-# git-webdiff: webdiff entry script
+# git-webdiff: webdiff entry script (updated)
 # This lets you run "git webdiff"
 
 set -euo pipefail
-
-# Check if we're being called as a difftool (wrapper mode)
-if [ -n "${WEBDIFF_AS_DIFFTOOL-}" ]; then
-    # We're being called by git difftool - act like the wrapper
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-    # Handle Ctrl-C gracefully
-    # trap 'echo -e "\nWebdiff server stopped by user" >&2; exit 0' INT
-
-    # Pass any additional webdiff configuration from WEBDIFF_ARGS.
-    # Environment variables can only be strings, so WEBDIFF_ARGS is a
-    # space-separated string of shell-quoted arguments. We use `eval`
-    # to safely parse it back into a bash array.
-    webdiff_args=()
-    if [ -n "${WEBDIFF_ARGS-}" ]; then
-        eval "webdiff_args=(${WEBDIFF_ARGS})"
-    fi
-
-    echo "Now starting webdiff with arguments: ${webdiff_args[@]}"
-
-    cd "$SCRIPT_DIR" && \
-      exec uv run -m webdiff.app "${webdiff_args[@]}" "$@"
-fi
 
 webdiff_args=()
 git_args=()
@@ -45,7 +22,10 @@ options:
   --port PORT, -p PORT         Port to serve on (default: random)
   --host HOST                  Host to serve on (default: localhost)
   --root-path PATH             Root path for the application (e.g., /webdiff)
-  --timeout MINUTES            Automatically shut down the server after this many minutes
+  --timeout MINUTES            Automatically shut down the server after this many minutes (default: 0, no timeout)
+  --no-timeout                 Disable automatic timeout (equivalent to --timeout 0)
+  --watch SECONDS              Watch for diff changes and enable reload (default: 10 seconds)
+  --no-watch                   Disable watch mode (equivalent to --watch 0)
   --unified LINES              Number of unified context lines (default: 8)
   --extra-dir-diff-args ARGS   Extra arguments for directory diff
   --extra-file-diff-args ARGS  Extra arguments for file diff
@@ -103,7 +83,7 @@ while [[ $# -gt 0 ]]; do
             show_help
             exit 0
             ;;
-        -p|--port|--timeout|--unified|--max-diff-width|--max-lines-for-syntax)
+        -p|--port|--timeout|--watch|--unified|--max-diff-width|--max-lines-for-syntax)
             if [[ -z "$2" || ! "$2" =~ ^[0-9]+$ ]]; then
                 echo "Error: $1 requires a numeric argument" >&2
                 exit 1
@@ -119,6 +99,10 @@ while [[ $# -gt 0 ]]; do
             webdiff_args+=("$1" "$2")
             shift 2
             ;;
+        --no-watch|--no-timeout)
+            webdiff_args+=("$1")
+            shift
+            ;;
         *)
             # All remaining arguments are git arguments
             git_args+=("$1")
@@ -127,12 +111,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-export WEBDIFF_AS_DIFFTOOL=1
-# We serialize the webdiff_args array into a single string that can be
-# passed via an environment variable. `printf "%q "` quotes each element
-# to handle spaces and special characters safely. This string is then
-# deserialized by the script when it's re-invoked by git-difftool.
-export WEBDIFF_ARGS="$(printf "%q " "${webdiff_args[@]}")"
+# Pass git context for hot reload functionality (environment variables for Python)
+export WEBDIFF_GIT_ARGS="$(printf "%q " "${git_args[@]}")"
+export WEBDIFF_CWD="$(pwd)"
 
 # First check if we're in a git repository
 if ! git rev-parse --git-dir > /dev/null 2>&1; then
@@ -161,6 +142,7 @@ if [ $has_diff -eq 0 ]; then
     exit 1
 fi
 
-# There are differences, run git difftool
-git_cmd=(git difftool -d -x "$(realpath "$0")" "${git_args[@]}")
-exec "${git_cmd[@]}"
+# Start the webdiff server directly
+# The Python server will call git difftool itself and manage the lifecycle
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" && exec uv run -m webdiff.app "${webdiff_args[@]}"
