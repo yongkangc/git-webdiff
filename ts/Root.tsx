@@ -224,6 +224,7 @@ export function Root() {
             reload([]);
           }}
           reloadInProgress={reloadInProgress}
+          currentGitArgs={git_args}
         />
 
         <div

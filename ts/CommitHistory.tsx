@@ -15,24 +15,47 @@ interface CommitHistoryProps {
   onSelectCommit: (hash: string) => void;
   onSelectWorkingChanges: () => void;
   reloadInProgress: boolean;
+  currentGitArgs: string[];
 }
 
 const MONO_FONT = '"JetBrains Mono", Consolas, "Liberation Mono", Menlo, Courier, monospace';
 const UI_FONT = 'Arial, sans-serif';
+
+// Parse git args to extract selected commit hash
+// Format: "{hash}^..{hash}" means viewing that specific commit
+function parseSelectedCommit(gitArgs: string[]): string | null {
+  if (gitArgs.length === 0) return null; // Working changes
+  const arg = gitArgs[0];
+  // Match pattern like "abc1234^..abc1234"
+  const match = arg.match(/^([a-f0-9]+)\^\.\.([a-f0-9]+)$/i);
+  if (match && match[1] === match[2]) {
+    return match[1];
+  }
+  return null;
+}
 
 export function CommitHistory({
   repoIdx,
   onSelectCommit,
   onSelectWorkingChanges,
   reloadInProgress,
+  currentGitArgs,
 }: CommitHistoryProps) {
   const [isExpanded, setIsExpanded] = React.useState(false);
   const [commits, setCommits] = React.useState<Commit[]>([]);
   const [hasMore, setHasMore] = React.useState(false);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const [selectedHash, setSelectedHash] = React.useState<string | null>(null);
   const [branch, setBranch] = React.useState<string | null>(null);
+
+  // Determine selected commit from current git args
+  const selectedHash = parseSelectedCommit(currentGitArgs);
+
+  // Check if a commit matches the selected hash (handles both full and short hashes)
+  const isCommitSelected = (commit: Commit) => {
+    if (!selectedHash) return false;
+    return commit.hash === selectedHash || commit.hash.startsWith(selectedHash) || selectedHash.startsWith(commit.hash);
+  };
 
   const fetchCommits = React.useCallback(async (offset: number = 0) => {
     setLoading(true);
@@ -65,14 +88,12 @@ export function CommitHistory({
 
   const handleSelectCommit = (commit: Commit) => {
     if (reloadInProgress) return;
-    setSelectedHash(commit.hash);
     // Show this specific commit's changes
     onSelectCommit(commit.hash);
   };
 
   const handleSelectWorkingChanges = () => {
     if (reloadInProgress) return;
-    setSelectedHash(null);
     onSelectWorkingChanges();
   };
 
@@ -232,7 +253,7 @@ export function CommitHistory({
                 padding: '8px 12px',
                 borderBottom: '1px solid #eaecef',
                 cursor: reloadInProgress ? 'not-allowed' : 'pointer',
-                background: selectedHash === commit.hash ? '#f1f8ff' : 'transparent',
+                background: isCommitSelected(commit) ? '#f1f8ff' : 'transparent',
                 opacity: reloadInProgress ? 0.6 : 1,
                 display: 'flex',
                 alignItems: 'flex-start',
@@ -240,23 +261,23 @@ export function CommitHistory({
                 transition: 'background 0.1s',
               }}
               onMouseEnter={(e) => {
-                if (!reloadInProgress && selectedHash !== commit.hash) {
+                if (!reloadInProgress && !isCommitSelected(commit)) {
                   e.currentTarget.style.background = '#f6f8fa';
                 }
               }}
               onMouseLeave={(e) => {
-                if (selectedHash !== commit.hash) {
+                if (!isCommitSelected(commit)) {
                   e.currentTarget.style.background = 'transparent';
                 }
               }}
             >
               {/* Selection indicator */}
               <span style={{
-                color: selectedHash === commit.hash ? '#0366d6' : '#959da5',
+                color: isCommitSelected(commit) ? '#0366d6' : '#959da5',
                 fontSize: '10px',
                 marginTop: '4px',
               }}>
-                {selectedHash === commit.hash ? '●' : '○'}
+                {isCommitSelected(commit) ? '●' : '○'}
               </span>
 
               {/* Commit info */}

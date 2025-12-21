@@ -126,8 +126,8 @@ class CachedStaticFiles(StaticFiles):
 
         # Set cache headers based on file type
         if path.endswith(('.js', '.css')):
-            # JavaScript and CSS files: cache for 1 week
-            response.headers['Cache-Control'] = 'public, max-age=604800'
+            # JavaScript and CSS files: no-cache during development
+            response.headers['Cache-Control'] = 'no-cache, must-revalidate'
         elif path.endswith(('.jpg', '.jpeg', '.png', '.gif', '.ico', '.svg', '.woff', '.woff2', '.ttf', '.eot')):
             # Images and fonts: cache for 1 month
             response.headers['Cache-Control'] = 'public, max-age=2592000'
@@ -274,6 +274,15 @@ def create_app(root_path: str = "") -> FastAPI:
 
                 html = html.replace('{{data}}', json.dumps(data, indent=2))
                 html = html.replace('{{ root_path }}', app.root_path)
+
+                # Add JS version for cache busting
+                js_path = os.path.join(WEBDIFF_DIR, 'static/js/file_diff.js')
+                if not os.path.exists(js_path):
+                    import webdiff
+                    webdiff_package_dir = os.path.dirname(webdiff.__file__)
+                    js_path = os.path.join(webdiff_package_dir, 'static/js/file_diff.js')
+                js_version = str(int(os.path.getmtime(js_path))) if os.path.exists(js_path) else '1'
+                html = html.replace('{{ js_version }}', js_version)
 
             return HTMLResponse(content=html)
         except Exception as e:
