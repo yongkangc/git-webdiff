@@ -231,6 +231,7 @@ export function Root() {
         {/* File browser panel */}
         <FileBrowser
           repoIdx={currentRepoIdx}
+          repoLabel={currentRepoLabel}
           onScrollToFile={(path) => {
             // Find the file diff element and scroll to it
             const fileElements = document.querySelectorAll('[data-file-path]');

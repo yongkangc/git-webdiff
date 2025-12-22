@@ -25,7 +25,44 @@ interface FileContentResponse {
 
 interface FileBrowserProps {
   repoIdx: number;
+  repoLabel: string;
   onScrollToFile: (path: string) => void;
+}
+
+// localStorage key for filter preferences
+const STORAGE_KEY_PREFIX = 'webdiff-file-filters-';
+
+interface FilterPreferences {
+  showChanged: boolean;
+  showUntracked: boolean;
+  showGitignored: boolean;
+}
+
+const DEFAULT_PREFERENCES: FilterPreferences = {
+  showChanged: true,
+  showUntracked: false,  // Default unchecked
+  showGitignored: false, // Default unchecked
+};
+
+function getFilterPreferences(repoLabel: string): FilterPreferences {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY_PREFIX + repoLabel);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      return { ...DEFAULT_PREFERENCES, ...parsed };
+    }
+  } catch (e) {
+    console.error('Failed to load filter preferences:', e);
+  }
+  return DEFAULT_PREFERENCES;
+}
+
+function saveFilterPreferences(repoLabel: string, prefs: FilterPreferences): void {
+  try {
+    localStorage.setItem(STORAGE_KEY_PREFIX + repoLabel, JSON.stringify(prefs));
+  } catch (e) {
+    console.error('Failed to save filter preferences:', e);
+  }
 }
 
 const MONO_FONT = '"JetBrains Mono", Consolas, "Liberation Mono", Menlo, Courier, monospace';
@@ -324,16 +361,24 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function FileBrowser({ repoIdx, onScrollToFile }: FileBrowserProps) {
+export function FileBrowser({ repoIdx, repoLabel, onScrollToFile }: FileBrowserProps) {
   const [isExpanded, setIsExpanded] = React.useState(false);
   const [files, setFiles] = React.useState<FilesResponse | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
-  // Filter state
-  const [showChanged, setShowChanged] = React.useState(true);
-  const [showUntracked, setShowUntracked] = React.useState(true);
-  const [showGitignored, setShowGitignored] = React.useState(true);
+  // Load initial filter preferences from localStorage
+  const initialPrefs = React.useMemo(() => getFilterPreferences(repoLabel), [repoLabel]);
+
+  // Filter state - initialized from localStorage with new defaults
+  const [showChanged, setShowChanged] = React.useState(initialPrefs.showChanged);
+  const [showUntracked, setShowUntracked] = React.useState(initialPrefs.showUntracked);
+  const [showGitignored, setShowGitignored] = React.useState(initialPrefs.showGitignored);
+
+  // Save preferences when they change
+  React.useEffect(() => {
+    saveFilterPreferences(repoLabel, { showChanged, showUntracked, showGitignored });
+  }, [repoLabel, showChanged, showUntracked, showGitignored]);
 
   // Modal state
   const [selectedFile, setSelectedFile] = React.useState<{
